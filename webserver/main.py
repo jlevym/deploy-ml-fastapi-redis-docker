@@ -1,96 +1,92 @@
-"""
-Web server script that exposes endpoints and pushes images to Redis for classification by model server. Polls
-Redis for response from model server.
-
-Adapted from https://www.pyimagesearch.com/2018/02/05/deep-learning-production-keras-redis-flask-apache/
-"""
 import base64
-import io
 import json
 import os
+import sys
 import time
-import uuid
 
-from keras.preprocessing.image import img_to_array
+from keras.applications import ResNet50
 from keras.applications import imagenet_utils
 import numpy as np
-from PIL import Image
 import redis
 
-from fastapi import FastAPI, File, HTTPException
-from starlette.requests import Request
-
-app = FastAPI()
+# Connect to Redis server
 db = redis.StrictRedis(host=os.environ.get("REDIS_HOST"))
 
-CLIENT_MAX_TRIES = int(os.environ.get("CLIENT_MAX_TRIES"))
+# Load the pre-trained Keras model (here we are using a model
+# pre-trained on ImageNet and provided by Keras, but you can
+# substitute in your own networks just as easily)
+model = ResNet50(weights="imagenet")
 
 
-def prepare_image(image, target):
-    # If the image mode is not RGB, convert it
-    if image.mode != "RGB":
-        image = image.convert("RGB")
+def base64_decode_image(a, dtype, shape):
+    # If this is Python 3, we need the extra step of encoding the
+    # serialized NumPy string as a byte object
+    if sys.version_info.major == 3:
+        a = bytes(a, encoding="utf-8")
 
-    # Resize the input image and preprocess it
-    image = image.resize(target)
-    image = img_to_array(image)
-    image = np.expand_dims(image, axis=0)
-    image = imagenet_utils.preprocess_input(image)
+    # Convert the string to a NumPy array using the supplied data
+    # type and target shape
+    a = np.frombuffer(base64.decodestring(a), dtype=dtype)
+    a = a.reshape(shape)
 
-    # Return the processed image
-    return image
-
-
-@app.get("/")
-def index():
-    return "Hello World!"
+    # Return the decoded image
+    return a
 
 
-@app.post("/predict")
-def predict(request: Request, img_file: bytes=File(...)):
-    data = {"success": False}
+def classify_process():
+    # Continually poll for new images to classify
+    while True:
+        # Pop off multiple images from Redis queue atomically
+        with db.pipeline() as pipe:
+            pipe.lrange(os.environ.get("IMAGE_QUEUE"), 0, int(os.environ.get("BATCH_SIZE")) - 1)
+            pipe.ltrim(os.environ.get("IMAGE_QUEUE"), int(os.environ.get("BATCH_SIZE")), -1)
+            queue, _ = pipe.execute()
 
-    if request.method == "POST":
-        image = Image.open(io.BytesIO(img_file))
-        image = prepare_image(image,
-                              (int(os.environ.get("IMAGE_WIDTH")),
-                               int(os.environ.get("IMAGE_HEIGHT")))
-                              )
+        imageIDs = []
+        batch = None
+        for q in queue:
+            # Deserialize the object and obtain the input image
+            q = json.loads(q.decode("utf-8"))
+            image = base64_decode_image(q["image"],
+                                        os.environ.get("IMAGE_DTYPE"),
+                                        (1, int(os.environ.get("IMAGE_HEIGHT")),
+                                         int(os.environ.get("IMAGE_WIDTH")),
+                                         int(os.environ.get("IMAGE_CHANS")))
+                                        )
 
-        # Ensure our NumPy array is C-contiguous as well, otherwise we won't be able to serialize it
-        image = image.copy(order="C")
+            # Check to see if the batch list is None
+            if batch is None:
+                batch = image
 
-        # Generate an ID for the classification then add the classification ID + image to the queue
-        k = str(uuid.uuid4())
-        image = base64.b64encode(image).decode("utf-8")
-        d = {"id": k, "image": image}
-        db.rpush(os.environ.get("IMAGE_QUEUE"), json.dumps(d))
+            # Otherwise, stack the data
+            else:
+                batch = np.vstack([batch, image])
 
-        # Keep looping for CLIENT_MAX_TRIES times
-        num_tries = 0
-        while num_tries < CLIENT_MAX_TRIES:
-            num_tries += 1
+            # Update the list of image IDs
+            imageIDs.append(q["id"])
 
-            # Attempt to grab the output predictions
-            output = db.get(k)
+        # Check to see if we need to process the batch
+        if len(imageIDs) > 0:
+            # Classify the batch
+            print("* Batch size: {}".format(batch.shape))
+            preds = model.predict(batch)
+            results = imagenet_utils.decode_predictions(preds)
 
-            # Check to see if our model has classified the input image
-            if output is not None:
-                # Add the output predictions to our data dictionary so we can return it to the client
-                output = output.decode("utf-8")
-                data["predictions"] = json.loads(output)
+            # Loop over the image IDs and their corresponding set of results from our model
+            for (imageID, resultSet) in zip(imageIDs, results):
+                # Initialize the list of output predictions
+                output = []
 
-                # Delete the result from the database and break from the polling loop
-                db.delete(k)
-                break
+                # Loop over the results and add them to the list of output predictions
+                for (imagenetID, label, prob) in resultSet:
+                    r = {"label": label, "probability": float(prob)}
+                    output.append(r)
 
-            # Sleep for a small amount to give the model a chance to classify the input image
-            time.sleep(float(os.environ.get("CLIENT_SLEEP")))
+                # Store the output predictions in the database, using image ID as the key so we can fetch the results
+                db.set(imageID, json.dumps(output))
 
-            # Indicate that the request was a success
-            data["success"] = True
-        else:
-            raise HTTPException(status_code=400, detail="Request failed after {} tries".format(CLIENT_MAX_TRIES))
+        # Sleep for a small amount
+        time.sleep(float(os.environ.get("SERVER_SLEEP")))
 
-    # Return the data dictionary as a JSON response
-    return data
+if __name__ == "__main__":
+    classify_process()

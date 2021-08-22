@@ -45,3 +45,4 @@ locust --host=http://localhost --no-web -c 20 -r 20
 ```
 
 The `--no-web` flag runs locust in CLI mode. You may also want to use locust's web interface with all its pretty graphs, if so, just run `local --host=http://localhost`.
+jeff: issue with browser staying up
